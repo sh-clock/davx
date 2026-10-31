@@ -1,0 +1,83 @@
+name: Rowstore CI
+
+# CI for the row-store fork: runs the pure-JVM :rowstore protocol tests,
+# core unit tests and builds the OSE debug APK (the artifact this project
+# exists to produce — the sandbox cannot build Android locally).
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - row-store
+
+concurrency:
+  group: rowstore-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JAVA_VERSION: 21   # keep in sync with gradle/gradle-daemon-jvm.properties
+
+jobs:
+  rowstore_tests:
+    name: Rowstore JVM tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive   # translations live in the l10n submodule
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+      - uses: gradle/actions/setup-gradle@v6.4.0
+      - name: Run :rowstore unit tests
+        run: ./gradlew rowstore:test
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rowstore-test-results
+          path: rowstore/build/test-results/**/*.xml
+          if-no-files-found: error
+
+  core_tests:
+    name: Core unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+      - uses: gradle/actions/setup-gradle@v6.4.0
+      - name: Run :core unit tests
+        run: ./gradlew core:testDebugUnitTest
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-results
+          path: core/build/test-results/**/*.xml
+          if-no-files-found: error
+
+  build_apk:
+    name: Build OSE debug APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+      - uses: gradle/actions/setup-gradle@v6.4.0
+      - name: Build debug APK
+        run: ./gradlew app-ose:assembleDebug
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: davx5-ose-debug-apk
+          path: app-ose/build/outputs/apk/**/*.apk
+          if-no-files-found: error
