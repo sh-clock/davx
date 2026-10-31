@@ -191,6 +191,9 @@ class AccountRepository @Inject constructor(
         val accountSettings = withContext(ioDispatcher) {
             accountSettingsFactory.create(accountId).also {
                 it.putInitialSettings(credentials, preconfigurationUrl)
+                // row-store accounts (calendar-web protocol v4.3): remember the
+                // server URL so sync/refresh use the row-store protocol
+                config.rowStoreServer?.let { server -> it.rowStoreServer = server }
             }
         }
 
@@ -288,6 +291,13 @@ class AccountRepository @Inject constructor(
             if (config.calDAV != null) {
                 // insert CalDAV service
                 val id = insertService(accountId, accountName, Service.TYPE_CALDAV, config.calDAV)
+
+                // row-store accounts (calendar-web protocol v4.3): remember the
+                // server URL so sync/refresh use the row-store protocol
+                if (config.rowStoreServer != null) {
+                    val calDavAccountSettings = accountSettingsFactory.create(accountId)
+                    calDavAccountSettings.rowStoreServer = config.rowStoreServer
+                }
 
                 // start CalDAV service detection (refresh collections)
                 RefreshCollectionsWorker.enqueue(context, id)

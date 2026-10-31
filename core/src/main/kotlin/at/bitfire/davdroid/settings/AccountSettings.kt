@@ -126,6 +126,19 @@ class AccountSettings @AssistedInject constructor(
         store.putValue(KEY_AUTH_STATE, authState.jsonSerializeString())
     }
 
+    // row-store account marker (calendar-web protocol v4.3)
+
+    /**
+     * Base URL of the row-store server if this is a row-store account
+     * (created by DavResourceFinder's row-store detection), else `null`.
+     *
+     * Set once at account creation; the username holds the AUTH_UI provisioning
+     * code and the password unlocks the row keys.
+     */
+    var rowStoreServer: io.ktor.http.Url?
+        get() = store.getValue(KEY_ROWSTORE_SERVER)?.let { runCatching { io.ktor.http.Url(it) }.getOrNull() }
+        set(value) { store.putValue(KEY_ROWSTORE_SERVER, value?.toString()) }
+
     /**
      * Returns whether users can modify credentials from the account settings screen.
      * Checks the value of [CREDENTIALS_LOCK] to be `0` or not equal to [CREDENTIALS_LOCK_AT_LOGIN_AND_SETTINGS].
@@ -360,6 +373,9 @@ class AccountSettings @AssistedInject constructor(
         const val KEY_USERNAME = "user_name"
         const val KEY_PASSWORD = "password"
         const val KEY_CERTIFICATE_ALIAS = "certificate_alias"
+
+        /** Base URL of the row-store server for row-store accounts (calendar-web protocol v4.3). */
+        const val KEY_ROWSTORE_SERVER = "rowstore_server"
 
         const val CREDENTIALS_LOCK = "login_credentials_lock"
         const val CREDENTIALS_LOCK_NO_LOCK = 0

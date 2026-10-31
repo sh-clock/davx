@@ -47,7 +47,8 @@ import javax.annotation.WillNotClose
  *
  * - services (CalDAV and/or CardDAV),
  * - principal,
- * - homeset/collections (multistatus responses are handled through dav4jvm).
+ * - homeset/collections (multistatus responses are handled through dav4jvm),
+ * - row-store servers (calendar-web protocol v4.3 — see [rowStoreDetector]).
  *
  * @param baseURI        user-given base URI (either mailto: URI or http(s):// URL)
  * @param credentials    optional login credentials (username/password, client certificate, OAuth state)
@@ -59,7 +60,8 @@ class DavResourceFinder @AssistedInject constructor(
     @Assisted private val credentials: Credentials? = null,
     @Assisted @WillNotClose private val httpClient: HttpClient,
     @Assisted private val log: Logger,
-    private val dnsRecordResolver: DnsRecordResolver
+    private val dnsRecordResolver: DnsRecordResolver,
+    private val rowStoreDetector: RowStoreDetector
 ) {
 
     @AssistedFactory
@@ -87,6 +89,17 @@ class DavResourceFinder @AssistedInject constructor(
      * service detection was not successful
      */
     suspend fun findInitialConfiguration(): Configuration {
+        // Row-store servers (encrypted row store, calendar-web protocol v4.3) are
+        // not WebDAV servers: probe them BEFORE the standard CardDAV/CalDAV
+        // detection, which would fail against the JSON API (and whose
+        // Basic/Digest credentials would be silently dropped, §4).
+        try {
+            rowStoreDetector.detect(baseURI, credentials, log)?.let { return it }
+        } catch (e: Exception) {
+            log.log(Level.INFO, "Row-store detection failed", e)
+            processException(e)
+        }
+
         var cardDavConfig: Configuration.ServiceInfo? = null
         var calDavConfig: Configuration.ServiceInfo? = null
 
@@ -465,7 +478,15 @@ class DavResourceFinder @AssistedInject constructor(
         val cardDAV: ServiceInfo?,
         val calDAV: ServiceInfo?,
 
-        val encountered401: Boolean
+        val encountered401: Boolean,
+
+        /**
+         * Set when the server is an encrypted row-store server (calendar-web
+         * protocol v4.3): its base URL. The account will be marked as a
+         * row-store account (AccountSettings.rowStoreServer) and its
+         * CalDAV "collections" are the server's calendars ({server}/clock/{uuid}/).
+         */
+        val rowStoreServer: Url? = null
     ) {
 
         data class ServiceInfo(

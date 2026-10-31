@@ -28,6 +28,7 @@ import at.bitfire.davdroid.push.PushRegistrationManager
 import at.bitfire.davdroid.repository.AccountRepository
 import at.bitfire.davdroid.repository.DavServiceRepository
 import at.bitfire.davdroid.servicedetection.RefreshCollectionsWorker.Companion.ARG_SERVICE_ID
+import at.bitfire.davdroid.servicedetection.RowStoreCollectionRefresher
 import at.bitfire.davdroid.sync.SyncNotificationManager
 import at.bitfire.davdroid.sync.account.InvalidAccountException
 import at.bitfire.davdroid.ui.DebugInfoActivity
@@ -69,6 +70,7 @@ class RefreshCollectionsWorker @AssistedInject constructor(
     private val notificationRegistry: NotificationRegistry,
     private val principalsRefresherFactory: PrincipalsRefresher.Factory,
     private val pushRegistrationManager: PushRegistrationManager,
+    private val rowStoreCollectionRefresher: RowStoreCollectionRefresher,
     private val serviceRefresherFactory: ServiceRefresher.Factory,
     private val serviceRepository: DavServiceRepository,
     private val syncNotificationManagerFactory: SyncNotificationManager.Factory
@@ -150,6 +152,20 @@ class RefreshCollectionsWorker @AssistedInject constructor(
             // cancel previous notification
             NotificationManagerCompat.from(applicationContext)
                 .cancel(serviceId.toString(), NotificationRegistry.NOTIFY_REFRESH_COLLECTIONS)
+
+            // Row-store services (encrypted row store, calendar-web protocol
+            // v4.3) are NOT WebDAV servers: refresh them with the row-store
+            // protocol. The WebDAV refresh chain below would PROPFIND the JSON
+            // API, get a silent-drop 404 and DELETE the collections.
+            if (rowStoreCollectionRefresher.refresh(service, accountId)) {
+                logger.info("Row-store service refreshed")
+
+                // credentials were accepted (the refresh derives the keys)
+                syncNotificationManagerFactory.create(accountId).dismissAuthenticationFailed()
+
+                // row-store collections have no push subscriptions; nothing to update
+                return Result.success()
+            }
 
             // create authenticating HttpClient (credentials taken from account settings)
             httpClientBuilder

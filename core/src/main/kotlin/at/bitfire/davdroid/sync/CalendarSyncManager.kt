@@ -11,7 +11,6 @@ import at.bitfire.davdroid.db.Collection
 import at.bitfire.davdroid.resource.local.LocalCalendar
 import at.bitfire.davdroid.resource.local.LocalEvent
 import at.bitfire.davdroid.resource.local.LocalResource
-import at.bitfire.davdroid.resource.remote.CalDavCollection
 import at.bitfire.davdroid.resource.remote.WebDavCollection
 import at.bitfire.davdroid.util.DavUtils
 import at.bitfire.davdroid.util.DavUtils.extractFileName
@@ -44,7 +43,7 @@ class CalendarSyncManager @AssistedInject constructor(
     @Assisted syncResult: SyncResult,
     @Assisted override val localCollection: LocalCalendar,
     @Assisted collectionInfo: Collection,
-    @Assisted override val remoteCollection: CalDavCollection,
+    @Assisted override val remoteCollection: WebDavCollection,
     @Assisted resync: ResyncType?,
     @Assisted settings: SyncSettings,
     private val productIds: ProductIds
@@ -66,7 +65,7 @@ class CalendarSyncManager @AssistedInject constructor(
             syncResult: SyncResult,
             localCalendar: LocalCalendar,
             collectionInfo: Collection,
-            remoteCollection: CalDavCollection,
+            remoteCollection: WebDavCollection,
             resync: ResyncType?,
             settings: SyncSettings
         ): CalendarSyncManager

@@ -100,6 +100,8 @@ dependencies {
     // gradle project dependencies
     implementation(project(":synctools"))
     implementation(project(":features:preconfigured-settings:api"))
+    // encrypted row-store protocol layer (calendar-web protocol v4.3)
+    implementation(project(":rowstore"))
 
     // Kotlin / Android
     implementation(libs.kotlin.stdlib)
