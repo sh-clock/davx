@@ -412,7 +412,7 @@ class RowStoreCalDavCollectionTest {
     // ---- v4.2 fallback (audit A1-3 / A3-3) ----
 
     @Test
-    fun `multiget falls back to per-row GETs on a v4.2 server (no /rows:batch)`() = runTest {
+    fun `multiget falls back to per-row GETs on a v42 server (no batch route)`() = runTest {
         val fake = FakeRowStore(katAuthUiHex, SecretKeySpec(hex(katKDataHex), "AES"))
         fake.batchRouteMissing = true
         val collection = collection(fake)

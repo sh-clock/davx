@@ -139,8 +139,9 @@ class RowStoreAccountTest {
     private fun fake(
         authUiHex: String = katAuthUiHex,
         salt: String = katSalt,
-        wrapped: String = katWrapped
-    ) = FakeRowStore(authUiHex, katRowKey(), salt, 100000, wrapped)
+        wrapped: String = katWrapped,
+        iters: Int = 100000
+    ) = FakeRowStore(authUiHex, katRowKey(), salt, iters, wrapped)
 
     private fun hex(s: String): ByteArray = ByteArray(s.length / 2) { i ->
         ((Character.digit(s[i * 2], 16) shl 4) + Character.digit(s[i * 2 + 1], 16)).toByte()
@@ -177,7 +178,9 @@ class RowStoreAccountTest {
 
     @Test
     fun `crypto-parity KAT - derivation matches the JavaScript reference`() = runTest {
-        val f = fake()
+        // the fake must expect the PARITY provisioning code and serve the
+        // PARITY config, otherwise open() is silently dropped before deriving
+        val f = FakeRowStore(parity.authUiHex, katRowKey(), parity.saltHex, parity.iters, parity.wrappedB64())
         val account = RowStoreAccount.open(HttpClient(f.engine), server, parity.authUiHex, parity.password)
         assertEquals(parity.kDataHex, account.keys.kData.encoded.joinToString("") { String.format("%02x", it) })
         assertEquals(parity.authUiHex, account.keys.authUiHex)
@@ -354,7 +357,7 @@ class RowStoreAccountTest {
     }
 
     @Test
-    fun `listCalendars falls back to per-row GETs on a v4.2 server (no /rows:batch)`() = runTest {
+    fun `listCalendars falls back to per-row GETs on a v42 server (no batch route)`() = runTest {
         val f = fake()
         f.batchRouteMissing = true
         val cal1 = "686247aa-e4c2-49cf-afa0-6437e41a7374"

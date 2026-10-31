@@ -97,8 +97,8 @@ object RowStoreUrls {
         while (i < bytes.size) {
             val b = bytes[i]
             if (b == '%'.code.toByte() && i + 2 < bytes.size) {
-                val hi = Character.digit(bytes[i + 1], 16)
-                val lo = Character.digit(bytes[i + 2], 16)
+                val hi = Character.digit(bytes[i + 1].toInt() and 0xFF, 16)
+                val lo = Character.digit(bytes[i + 2].toInt() and 0xFF, 16)
                 if (hi >= 0 && lo >= 0) {
                     out[o++] = ((hi shl 4) or lo).toByte()
                     i += 3
