@@ -25,20 +25,23 @@
  * re-downloaded (SyncManager: "Upload rejected because of a failed precondition").
  *
  * The HTTP request machinery (bearer header + error mapping) lives in
- * [RowStoreApi]; the URL grammar lives in [RowStoreUrls].
+ * [RowStoreApi]; the URL grammar and percent codec (encodeURIComponent parity)
+ * live in [RowStoreUrls].
  */
 package at.bitfire.davdroid.resource.rowstore
 
 import at.bitfire.dav4jvm.ktor.exception.DavException
+import at.bitfire.dav4jvm.ktor.exception.NotFoundException
 import at.bitfire.dav4jvm.ktor.resolve
 import io.ktor.client.HttpClient
+import io.ktor.client.request.setBody
+import io.ktor.client.request.url
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpMethod
 import io.ktor.http.Url
 import io.ktor.http.content.OutgoingContent
 import io.ktor.http.contentType
-import io.ktor.client.statement.HttpResponse
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.serialization.json.JsonPrimitive
@@ -56,7 +59,7 @@ class RowStoreCalDavCollection(
     server: Url,
     /** UUID of the calendar whose evt rows this collection exposes. */
     val calUuid: String,
-    /** AUTH_UI bearer token (hex64). */
+    /** AUTH_UI bearer token (hex64) — the DERIVED token (RowStoreAccount.keys.authUiHex). */
     authUiHex: String,
     /** Row encryption key (K_data). */
     private val rowKey: SecretKey
@@ -76,7 +79,8 @@ class RowStoreCalDavCollection(
     internal fun fileNameOf(url: Url): String {
         val base = collectionUrl.encodedPath
         require(url.encodedPath.startsWith(base)) { "member URL $url is not below $collectionUrl" }
-        return java.net.URLDecoder.decode(url.encodedPath.removePrefix(base).trimEnd('/'), "UTF-8")
+        // decodeURIComponent parity ('+' stays '+', %XX decodes)
+        return RowStoreUrls.percentDecode(url.encodedPath.removePrefix(base).trimEnd('/'))
     }
 
     // ---- create ----
@@ -86,7 +90,9 @@ class RowStoreCalDavCollection(
         content: OutgoingContent,
         additionalHeaders: Map<String, String>
     ): RowStoreCollection.PutMemberResult {
+        validateUid(fileName)
         val text = content.readAsText()
+        validatePayloadSize(text)
         val id = rowId(fileName)
         // If-None-Match semantics via §9c: a fresh row is created with ver 1;
         // if the row already exists, the server answers 412 → mapped to
@@ -125,7 +131,7 @@ class RowStoreCalDavCollection(
             val uid = id.removePrefix("evt:$calUuid:")
             emit(
                 RowStoreCollection.MemberState(
-                    href = collectionUrl.resolve(uid)!!,
+                    href = collectionUrl.resolve(RowStoreUrls.percentEncode(uid))!!,
                     eTag = ver.toString()
                 )
             )
@@ -138,37 +144,31 @@ class RowStoreCalDavCollection(
     ): Flow<RowStoreCollection.MultiGetItem> = flow {
         if (urls.isEmpty()) return@flow
         val ids = urls.map { rowId(fileNameOf(it)) }
-        // §9b: one batch request per ≤256 ids.
+        // §9b: one batch request per ≤256 ids; v4.2 servers (no /rows:batch)
+        // fall back to per-row GETs (§5.1c/§5.4 degrade, web client parity).
         ids.chunked(256).forEach { chunk ->
-            val body = buildJsonObject {
-                put("ids", kotlinx.serialization.json.buildJsonArray {
-                    chunk.forEach { add(JsonPrimitive(it)) }
-                })
-            }
-            val response = api.request {
-                method = HttpMethod.Post
-                url(api.baseUrl + "/rows:batch")
-                contentType(ContentType.Application.Json)
-                setBody(body.toString())
-            }
-            val json = api.bodyAsJson(response)
-            val rows = json["rows"]?.jsonArray ?: throw DavException("batch response without rows")
-            for (row in rows) {
-                val obj = row.jsonObject
-                val id = obj["id"]?.jsonPrimitive?.content ?: continue
-                if (obj["missing"]?.jsonPrimitive?.content == "true") continue
-                val ver = obj["ver"]?.jsonPrimitive?.content?.toLongOrNull()
+            fetchEnvelopes(chunk).forEach { envelope ->
+                val id = envelope["id"]?.jsonPrimitive?.content ?: return@forEach
+                if (envelope["missing"]?.jsonPrimitive?.content == "true") return@forEach
+                val ver = envelope["ver"]?.jsonPrimitive?.content?.toLongOrNull()
                     ?: throw DavException("batch entry without ver: $id")
-                val nonce = obj["nonce"]?.jsonPrimitive?.content
+                val nonce = envelope["nonce"]?.jsonPrimitive?.content
                     ?: throw DavException("batch entry without nonce: $id")
-                val ct = obj["ct"]?.jsonPrimitive?.content
+                val ct = envelope["ct"]?.jsonPrimitive?.content
                     ?: throw DavException("batch entry without ct: $id")
                 val uid = id.removePrefix("evt:$calUuid:")
-                val plain = RowStoreCrypto.decryptRow(rowKey, id, ver, nonce, ct)
-                val ical = RowStoreCrypto.unquoteJsonString(plain)
+                val ical = try {
+                    val plain = RowStoreCrypto.decryptRow(rowKey, id, ver, nonce, ct)
+                    RowStoreCrypto.unquoteJsonString(plain)
+                } catch (e: Exception) {
+                    // undecryptable row: skip (and retry next sync, like the web
+                    // client's corrupt-row handling); never abort the whole sync
+                    logger.warning("Skipping corrupt row $id: ${e.message}")
+                    return@forEach
+                }
                 emit(
                     RowStoreCollection.MultiGetItem(
-                        url = collectionUrl.resolve(uid)!!,
+                        url = collectionUrl.resolve(RowStoreUrls.percentEncode(uid))!!,
                         eTag = ver.toString(),
                         content = ical
                     )
@@ -185,7 +185,9 @@ class RowStoreCalDavCollection(
         ifETag: String?,
         additionalHeaders: Map<String, String>
     ): RowStoreCollection.PutMemberResult {
+        validateUid(fileName)
         val text = content.readAsText()
+        validatePayloadSize(text)
         val id = rowId(fileName)
         // If-Match semantics via §9c: PUT at ver = etag+1 with If-Match: "<etag>".
         // A mismatch (or vanished row) → 412/404 → dav4jvm typed exceptions →
@@ -205,16 +207,77 @@ class RowStoreCalDavCollection(
         ifETag: String?,
         additionalHeaders: Map<String, String>
     ) {
+        validateUid(fileName)
         // NOTE: the row-store DELETE is idempotent and takes no If-Match
         // (protocol.md §9 documents the semantic loss). A concurrent
         // delete-then-recreate race resolves at the next sync via the manifest.
         api.request {
             method = HttpMethod.Delete
-            url(api.baseUrl + "/rows/" + java.net.URLEncoder.encode(rowId(fileName), "UTF-8"))
+            url(api.baseUrl + "/rows/" + RowStoreUrls.percentEncode(rowId(fileName)))
         }
     }
 
     // ---- internals ----
+
+    /** §2 row id grammar: uid non-empty, ≤ 200 chars, no ':'. */
+    private fun validateUid(fileName: String) {
+        if (!RowStoreUrls.isValidUid(fileName))
+            throw DavException(
+                "row-store: event UID \"$fileName\" violates the row id grammar " +
+                    "(non-empty, ≤ ${RowStoreUrls.UID_MAX} chars, no ':') — refusing to corrupt the store")
+    }
+
+    /** §2 size law: ct (payload + 16 B GCM tag) ≤ 64 KiB — checked client-side
+     *  so an oversized event fails with a clear error instead of a server 400. */
+    private fun validatePayloadSize(text: String) {
+        val utf8 = text.toByteArray(Charsets.UTF_8).size
+        if (utf8 + 16 > 64 * 1024)
+            throw DavException(
+                "row-store: event payload is $utf8 bytes; the protocol caps rows at 64 KiB (payload + 16 B GCM tag)")
+    }
+
+    /**
+     * Fetches row envelopes for [ids]: §9b POST /rows:batch, with per-row GET
+     * fallback when the route is unknown (v4.2 server, §5.1c).
+     */
+    private suspend fun fetchEnvelopes(ids: List<String>): List<MutableMap<String, kotlinx.serialization.json.JsonElement>> {
+        val out = ArrayList<MutableMap<String, kotlinx.serialization.json.JsonElement>>(ids.size)
+        try {
+            val body = buildJsonObject {
+                put("ids", kotlinx.serialization.json.buildJsonArray {
+                    ids.forEach { add(JsonPrimitive(it)) }
+                })
+            }
+            val response = api.request {
+                method = HttpMethod.Post
+                url(api.baseUrl + "/rows:batch")
+                contentType(ContentType.Application.Json)
+                setBody(body.toString())
+            }
+            val json = api.bodyAsJson(response)
+            val rows = json["rows"]?.jsonArray ?: throw DavException("batch response without rows")
+            for (row in rows)
+                out += row.jsonObject.toMutableMap()
+            return out
+        } catch (e: RowStoreSilentDropException) {
+            logger.warning("/rows:batch not available (protocol < 4.3?); falling back to per-row GETs")
+        }
+        // per-row fallback
+        for (id in ids)
+            getRowEnvelope(id)?.let { out += it.toMutableMap() }
+        return out
+    }
+
+    /** GET /rows/{id} — the envelope as a JSON object, or null when missing. */
+    private suspend fun getRowEnvelope(id: String): Map<String, kotlinx.serialization.json.JsonElement>? = try {
+        val response = api.request {
+            method = HttpMethod.Get
+            url(api.baseUrl + "/rows/" + RowStoreUrls.percentEncode(id))
+        }
+        api.bodyAsJson(response)
+    } catch (e: NotFoundException) {
+        null
+    }
 
     private suspend fun putRow(
         id: String,
@@ -229,7 +292,7 @@ class RowStoreCalDavCollection(
         }
         val response = api.request {
             method = HttpMethod.Put
-            url(api.baseUrl + "/rows/" + java.net.URLEncoder.encode(id, "UTF-8"))
+            url(api.baseUrl + "/rows/" + RowStoreUrls.percentEncode(id))
             contentType(ContentType.Application.Json)
             ifMatchVer?.let { headers.append(HttpHeaders.IfMatch, "\"$it\"") }
             ifNoneMatch?.let { headers.append(HttpHeaders.IfNoneMatch, it) }

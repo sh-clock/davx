@@ -30,7 +30,7 @@ interface RowStoreCollection {
         val eTag: String?
     ) {
         val fileName: String
-            get() = href.encodedPath.substringAfterLast('/').let { java.net.URLDecoder.decode(it, "UTF-8") }
+            get() = href.encodedPath.substringAfterLast('/').let { RowStoreUrls.percentDecode(it) }
     }
 
     data class MultiGetItem(

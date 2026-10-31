@@ -13,6 +13,7 @@ import at.bitfire.davdroid.resource.remote.CalDavCollection
 import at.bitfire.davdroid.resource.remote.CalendarQueryFilter
 import at.bitfire.davdroid.resource.remote.RowStoreWebDavCollection
 import at.bitfire.davdroid.resource.remote.WebDavCollection
+import at.bitfire.davdroid.resource.rowstore.RowStoreAuthenticationException
 import at.bitfire.davdroid.resource.rowstore.RowStoreCalDavCollection
 import at.bitfire.davdroid.settings.AccountSettingsFactory
 import at.bitfire.synctools.storage.LocalStorageClient
@@ -67,26 +68,52 @@ class CalendarSyncer @AssistedInject constructor(
     override fun getDbSyncCollections(serviceId: Long): List<Collection> =
         collectionRepository.getSyncCalendars(serviceId)
 
-    /**
-     * Row-store session for this sync run (one HTTP client + one key derivation
-     * for all row-store collections), or `null` when the account is not a
-     * row-store account. Initialized lazily on the first [syncCollection] call.
-     */
-    private var rowStoreSession: RowStoreSyncSession? = null
+    /** Outcome of the row-store account check (resolved once per sync run). */
+    private sealed interface RowStoreAccess {
+        /** Not a row-store account — sync with plain CalDAV. */
+        object NotRowStore : RowStoreAccess
 
-    private suspend fun rowStoreSession(): RowStoreSyncSession? {
-        rowStoreSession?.let { return it }
-        val accountSettings = accountSettingsFactory.create(accountId)
-        val server = accountSettings.rowStoreServer ?: return null
-        val session = RowStoreSyncSession.open(httpClientBuilder, server, accountSettings.credentials(), logger)
-        rowStoreSession = session
-        return session
+        /** Row-store session ready (one client + one key derivation for the whole run). */
+        data class Ready(val session: RowStoreSyncSession) : RowStoreAccess
+
+        /** Credentials rejected — [syncResult.authenticationFailed] is set; skip. */
+        object AuthenticationFailed : RowStoreAccess
+    }
+
+    private var rowStoreAccess: RowStoreAccess? = null
+
+    /**
+     * Resolves the row-store access for this sync run. The account settings are
+     * read once; the session (auth-free HTTP client + PBKDF2 derivation) is
+     * shared by all row-store collections.
+     */
+    private suspend fun rowStoreAccess(): RowStoreAccess {
+        rowStoreAccess?.let { return it }
+        val access: RowStoreAccess = try {
+            val accountSettings = accountSettingsFactory.create(accountId)
+            val server = accountSettings.rowStoreServer
+            if (server == null)
+                RowStoreAccess.NotRowStore
+            else
+                RowStoreAccess.Ready(
+                    RowStoreSyncSession.open(httpClientBuilder, server, accountSettings.credentials(), logger)
+                )
+        } catch (e: RowStoreAuthenticationException) {
+            // wrong provisioning code / wrong password: same effect as HTTP 401 —
+            // set the flag Syncer.syncCollectionContents checks before every
+            // collection and show the "credentials were rejected" notification
+            logger.log(Level.WARNING, "Row-store authentication failed: ${e.message}", e)
+            syncResult.authenticationFailed = true
+            RowStoreAccess.AuthenticationFailed
+        }
+        rowStoreAccess = access
+        return access
     }
 
     override fun close() {
         super.close()
-        rowStoreSession?.close()
-        rowStoreSession = null
+        (rowStoreAccess as? RowStoreAccess.Ready)?.session?.close()
+        rowStoreAccess = null
     }
 
     override suspend fun syncCollection(
@@ -113,30 +140,42 @@ class CalendarSyncer @AssistedInject constructor(
         // through the row-store adapter; their own auth-free HTTP client is used
         // because the account's Basic/Digest credentials never apply (the worker
         // would treat them as a wrong token and silently drop every request).
-        val session = rowStoreSession()
+        // NOTE: timeRangePastDays is IGNORED for row-store accounts — the row
+        // store has no server-side time filter; the whole store syncs.
         val remote: WebDavCollection
         val syncHttpClient: io.ktor.client.HttpClient
-        if (session != null && session.calUuidOf(remoteCollectionInfo.url) != null) {
-            val calUuid = session.calUuidOf(remoteCollectionInfo.url)!!
-            remote = RowStoreWebDavCollection(
-                httpClient = session.httpClient,
-                delegate = RowStoreCalDavCollection(
-                    httpClient = session.httpClient,
-                    server = session.server,
-                    calUuid = calUuid,
-                    authUiHex = session.account.keys.authUiHex,
-                    rowKey = session.account.keys.kData
+        when (val access = rowStoreAccess()) {
+            is RowStoreAccess.AuthenticationFailed ->
+                // credentials rejected — skip this collection (Syncer checks the
+                // flag before every following one)
+                return
+
+            RowStoreAccess.NotRowStore -> {
+                remote = CalDavCollection(
+                    httpClient = httpClient,
+                    url = remoteCollectionInfo.url,
+                    filter = CalendarQueryFilter(components = listOf(Component.VEVENT), timeRangeStart = limitStart)
                 )
-            )
-            syncHttpClient = session.httpClient
-            logger.log(Level.INFO, "Syncing row-store calendar {0} via {1}", arrayOf(calUuid, session.server))
-        } else {
-            remote = CalDavCollection(
-                httpClient = httpClient,
-                url = remoteCollectionInfo.url,
-                filter = CalendarQueryFilter(components = listOf(Component.VEVENT), timeRangeStart = limitStart)
-            )
-            syncHttpClient = httpClient
+                syncHttpClient = httpClient
+            }
+
+            is RowStoreAccess.Ready -> {
+                val calUuid = access.session.calUuidOf(remoteCollectionInfo.url)
+                    ?: throw at.bitfire.dav4jvm.ktor.exception.DavException(
+                        "row-store account, but collection URL is not a row-store URL: ${remoteCollectionInfo.url}")
+                remote = RowStoreWebDavCollection(
+                    httpClient = access.session.httpClient,
+                    delegate = RowStoreCalDavCollection(
+                        httpClient = access.session.httpClient,
+                        server = access.session.server,
+                        calUuid = calUuid,
+                        authUiHex = access.session.account.keys.authUiHex,
+                        rowKey = access.session.account.keys.kData
+                    )
+                )
+                syncHttpClient = access.session.httpClient
+                logger.log(Level.INFO, "Syncing row-store calendar {0} via {1}", arrayOf(calUuid, access.session.server))
+            }
         }
 
         val syncManager = calendarSyncManagerFactory.calendarSyncManager(

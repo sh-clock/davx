@@ -10,11 +10,14 @@ package at.bitfire.davdroid.sync
 
 import at.bitfire.davdroid.network.HttpClientBuilder
 import at.bitfire.davdroid.resource.rowstore.RowStoreAccount
+import at.bitfire.davdroid.resource.rowstore.RowStoreAuthenticationException
+import at.bitfire.davdroid.resource.rowstore.RowStoreSilentDropException
 import at.bitfire.davdroid.resource.rowstore.RowStoreUrls
 import at.bitfire.davdroid.settings.Credentials
 import io.ktor.client.HttpClient
 import io.ktor.http.Url
 import java.io.Closeable
+import java.util.logging.Level
 import java.util.logging.Logger
 
 class RowStoreSyncSession private constructor(
@@ -40,8 +43,11 @@ class RowStoreSyncSession private constructor(
          * Opens the session: builds the auth-free client, fetches /config and
          * derives the keys from the account credentials.
          *
-         * @throws at.bitfire.dav4jvm.ktor.exception.DavException on network/silent-drop errors
-         * @throws javax.crypto.AEADBadTagException on a wrong password
+         * @throws RowStoreAuthenticationException when the provisioning code is
+         *   not valid on the server (§4 silent drop) or the password is wrong
+         *   (GCM unwrap fails) — so callers can surface an authentication
+         *   failure like they would for HTTP 401
+         * @throws at.bitfire.dav4jvm.ktor.exception.DavException on other errors (network, malformed config)
          */
         suspend fun open(
             httpClientBuilder: HttpClientBuilder,
@@ -50,15 +56,23 @@ class RowStoreSyncSession private constructor(
             logger: Logger
         ): RowStoreSyncSession {
             val username = credentials.username
-                ?: throw at.bitfire.dav4jvm.ktor.exception.DavException(
+                ?: throw RowStoreAuthenticationException(
                     "row-store: no provisioning code (username) in account credentials")
             val password = credentials.password
-                ?: throw at.bitfire.dav4jvm.ktor.exception.DavException(
+                ?: throw RowStoreAuthenticationException(
                     "row-store: no password in account credentials")
             val client = httpClientBuilder.build()
             try {
-                logger.info("Opening row-store session with $server")
-                val account = RowStoreAccount.open(client, server, username, password.asString())
+                logger.log(Level.INFO, "Opening row-store session with $server")
+                val account = try {
+                    RowStoreAccount.open(client, server, username, password.asString())
+                } catch (e: RowStoreSilentDropException) {
+                    throw RowStoreAuthenticationException(
+                        "row-store: provisioning code not valid on $server (§4 silent drop)")
+                } catch (e: javax.crypto.AEADBadTagException) {
+                    throw RowStoreAuthenticationException(
+                        "row-store: wrong password for $server (unwrap failed)")
+                }
                 return RowStoreSyncSession(account)
             } catch (t: Throwable) {
                 client.close()

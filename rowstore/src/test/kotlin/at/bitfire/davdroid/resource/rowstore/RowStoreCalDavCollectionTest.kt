@@ -36,11 +36,11 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import java.util.Base64
 import javax.crypto.spec.SecretKeySpec
 
 class RowStoreCalDavCollectionTest {
@@ -60,6 +60,9 @@ class RowStoreCalDavCollectionTest {
     private class FakeRowStore(private val authUiHex: String, private val rowKey: javax.crypto.SecretKey) {
         val rows = mutableMapOf<String, Pair<Long, RowStoreCrypto.Envelope>>()   // id -> (ver, env)
         val requestLog = mutableListOf<Pair<HttpMethod, String>>()
+
+        /** When set, POST /rows:batch is answered with a silent drop (v4.2 server). */
+        var batchRouteMissing = false
 
         fun manifestJson(): String {
             val items = rows.keys.sorted().joinToString(",") { id ->
@@ -95,6 +98,8 @@ class RowStoreCalDavCollectionTest {
                     respond(manifestJson(), HttpStatusCode.OK, jsonHeaders())
 
                 request.method == HttpMethod.Post && path == "/rows:batch" -> {
+                    if (batchRouteMissing)
+                        return@MockEngine respond("", HttpStatusCode.NotFound)  // v4.2: unknown route
                     val ids = Json.parseToJsonElement(body!!).jsonObject["ids"]!!.jsonArray
                         .map { it.jsonPrimitive.content }
                     val items = ids.joinToString(",") { id ->
@@ -104,8 +109,16 @@ class RowStoreCalDavCollectionTest {
                     respond("""{"rows":[$items]}""", HttpStatusCode.OK, jsonHeaders())
                 }
 
+                request.method == HttpMethod.Get && path.startsWith("/rows/") -> {
+                    // decode with decodeURIComponent semantics ('+' stays '+')
+                    val id = RowStoreUrls.percentDecode(path.removePrefix("/rows/"))
+                    val row = rows[id]
+                        ?: return@MockEngine respond("""{"error":"not_found"}""", HttpStatusCode.NotFound, jsonHeaders())
+                    respond(envelopeJson(id), HttpStatusCode.OK, jsonHeaders())
+                }
+
                 request.method == HttpMethod.Put && path.startsWith("/rows/") -> {
-                    val id = java.net.URLDecoder.decode(path.removePrefix("/rows/"), "UTF-8")
+                    val id = RowStoreUrls.percentDecode(path.removePrefix("/rows/"))
                     val json = Json.parseToJsonElement(body!!).jsonObject
                     val ver = json["ver"]!!.jsonPrimitive.content.toLong()
                     val env = RowStoreCrypto.Envelope(
@@ -138,7 +151,7 @@ class RowStoreCalDavCollectionTest {
                 }
 
                 request.method == HttpMethod.Delete && path.startsWith("/rows/") -> {
-                    val id = java.net.URLDecoder.decode(path.removePrefix("/rows/"), "UTF-8")
+                    val id = RowStoreUrls.percentDecode(path.removePrefix("/rows/"))
                     rows.remove(id)
                     respond("{}", HttpStatusCode.OK, jsonHeaders())
                 }
@@ -187,15 +200,6 @@ class RowStoreCalDavCollectionTest {
     fun `crypto KAT - derive matches the JavaScript reference`() {
         val keys = katKeys()
         assertEquals(katAuthUiHex, keys.authUiHex)
-        assertEquals(
-            katKDataHex,
-            Base64.getEncoder().encodeToString(
-                java.security.MessageDigest.getInstance("SHA-256").run {
-                    // compare via hex of the raw key bytes
-                    hex(katKDataHex)
-                }
-            ).let { _ -> katKDataHex } // (hex compare below)
-        )
         val kDataHex = keys.kData.encoded.joinToString("") { String.format("%02x", it) }
         assertEquals(katKDataHex, kDataHex)
     }
@@ -379,5 +383,116 @@ class RowStoreCalDavCollectionTest {
         val urls = (1..600).map { collection.collectionUrl.resolve("e$it")!! }
         collection.multiget(urls, RowStoreCollection.Capabilities()).toList()
         assertEquals(3, fake.requestLog.count { it.first == HttpMethod.Post && it.second == "/rows:batch" })
+    }
+
+    // ---- percent-encoding parity (audit A1-4 / A2-1) ----
+
+    @Test
+    fun `UIDs with '+' and spaces address the SAME row on create and multiget`() = runTest {
+        val fake = FakeRowStore(katAuthUiHex, SecretKeySpec(hex(katKDataHex), "AES"))
+        val collection = collection(fake)
+        // "a b+c" must map to the row id evt:{cal}:a b+c — the '+' must survive
+        collection.createMember("a b+c", textContent(ical))
+        assertTrue(fake.rows.containsKey("evt:$calUuid:a b+c"))
+
+        // listing → multiget round-trip through href percent-encoding
+        val members = collection.listFilteredMembers().toList()
+        assertEquals(1, members.size)
+        assertEquals("a b+c", collection.fileNameOf(members[0].href))
+        val items = collection.multiget(listOf(members[0].href), RowStoreCollection.Capabilities()).toList()
+        assertEquals(1, items.size)
+        assertEquals(ical, items[0].content)
+        assertEquals("a b+c", collection.fileNameOf(items[0].url))
+        // a distinct UID that differs only by +/-/space must be a DIFFERENT row
+        collection.createMember("a b-c", textContent(ical))
+        assertTrue(fake.rows.containsKey("evt:$calUuid:a b-c"))
+        assertEquals(2, fake.rows.size)
+    }
+
+    // ---- v4.2 fallback (audit A1-3 / A3-3) ----
+
+    @Test
+    fun `multiget falls back to per-row GETs on a v4.2 server (no /rows:batch)`() = runTest {
+        val fake = FakeRowStore(katAuthUiHex, SecretKeySpec(hex(katKDataHex), "AES"))
+        fake.batchRouteMissing = true
+        val collection = collection(fake)
+        collection.createMember("a", textContent(ical))
+        collection.createMember("b", textContent(ical.replace("Harness", "Second")))
+        val urls = listOf(collection.collectionUrl.resolve("a")!!, collection.collectionUrl.resolve("b")!!)
+        val items = collection.multiget(urls, RowStoreCollection.Capabilities()).toList()
+        assertEquals(2, items.size)
+        assertEquals(ical, items[0].content)
+        // one batch attempt + two per-row GETs
+        assertEquals(1, fake.requestLog.count { it.first == HttpMethod.Post && it.second == "/rows:batch" })
+        assertEquals(2, fake.requestLog.count { it.first == HttpMethod.Get && it.second.startsWith("/rows/") })
+    }
+
+    // ---- corrupt-row isolation (audit A2-7) ----
+
+    @Test
+    fun `multiget skips an undecryptable row instead of aborting the sync`() = runTest {
+        val fake = FakeRowStore(katAuthUiHex, SecretKeySpec(hex(katKDataHex), "AES"))
+        val collection = collection(fake)
+        collection.createMember("good", textContent(ical))
+        // a foreign-key-encrypted row: listing shows it, decryption fails
+        val foreignKey = SecretKeySpec(ByteArray(32) { it.toByte() }, "AES")
+        fake.rows["evt:$calUuid:corrupt"] = 1L to RowStoreCrypto.encryptRow(
+            foreignKey, "evt:$calUuid:corrupt", 1, RowStoreCrypto.quoteJsonString(ical)
+        )
+        val members = collection.listFilteredMembers().toList()
+        assertEquals(2, members.size)
+        val items = collection.multiget(members.map { it.href }, RowStoreCollection.Capabilities()).toList()
+        // only the good row is emitted; the corrupt one is skipped, not thrown
+        assertEquals(1, items.size)
+        assertEquals("good", collection.fileNameOf(items[0].url))
+    }
+
+    // ---- member validation (audit A2-6 / A2-9) ----
+
+    @Test
+    fun `createMember rejects UIDs that violate the row id grammar`() = runTest {
+        val fake = FakeRowStore(katAuthUiHex, SecretKeySpec(hex(katKDataHex), "AES"))
+        val collection = collection(fake)
+        assertThrows(DavException::class.java) {
+            kotlinx.coroutines.runBlocking { collection.createMember("with:colon", textContent(ical)) }
+        }
+        assertThrows(DavException::class.java) {
+            kotlinx.coroutines.runBlocking { collection.createMember("", textContent(ical)) }
+        }
+        assertThrows(DavException::class.java) {
+            kotlinx.coroutines.runBlocking { collection.createMember("x".repeat(201), textContent(ical)) }
+        }
+        assertTrue(fake.rows.isEmpty())
+    }
+
+    @Test
+    fun `createMember rejects payloads over the 64 KiB row cap`() = runTest {
+        val fake = FakeRowStore(katAuthUiHex, SecretKeySpec(hex(katKDataHex), "AES"))
+        val collection = collection(fake)
+        val huge = "X".repeat(64 * 1024 - 15)     // payload + 16 B tag = 65537 > 64 KiB
+        assertThrows(DavException::class.java) {
+            kotlinx.coroutines.runBlocking { collection.createMember("big", textContent(huge)) }
+        }
+        assertTrue(fake.rows.isEmpty())
+    }
+
+    // ---- error classification (audit A1-7) ----
+
+    @Test
+    fun `a foreign 404 page is NOT classified as NotFound`() = runTest {
+        val engine = MockEngine { _ ->
+            respond("<html>404 page not found</html>", HttpStatusCode.NotFound,
+                headersOf(HttpHeaders.ContentType, "text/html"))
+        }
+        val collection = RowStoreCalDavCollection(
+            HttpClient(engine), server, calUuid, katAuthUiHex, SecretKeySpec(hex(katKDataHex), "AES")
+        )
+        val ex = assertThrows(DavException::class.java) {
+            kotlinx.coroutines.runBlocking { collection.deleteMember("gone") }
+        }
+        // generic DavException, NOT NotFoundException (which callers use for
+        // "row missing" decisions)
+        assertFalse(ex is at.bitfire.dav4jvm.ktor.exception.NotFoundException)
+        assertTrue(ex.message!!.contains("row-store error 404"))
     }
 }

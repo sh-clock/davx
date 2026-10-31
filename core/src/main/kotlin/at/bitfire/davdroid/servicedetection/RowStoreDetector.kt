@@ -14,7 +14,9 @@
  * wrong code is a §4 silent drop, indistinguishable from a non-row-store
  * server, so detection falls through to the standard WebDAV path). After the
  * probe, the account is opened (/config + key derivation) and the calendars
- * are listed from the cmeta rows.
+ * are listed from the cmeta rows. A protocol version other than 4.3 is NOT
+ * fatal (soft gate, protocol §5.4): §9b batch reads degrade to per-row GETs
+ * inside the row-store layer, exactly like the web client.
  *
  * A wrong password (GCM unwrap fails) is an authentication failure and is
  * reported as [DavResourceFinder.Configuration.encountered401] so the login
@@ -34,7 +36,6 @@ import io.ktor.client.statement.bodyAsText
 import io.ktor.http.HttpHeaders
 import io.ktor.http.Url
 import io.ktor.http.isSuccess
-import kotlinx.coroutines.flow.toList
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -106,11 +107,16 @@ class RowStoreDetector @Inject constructor(
                 }
 
                 // 3. list the calendars from the cmeta rows
-                val calendars = account.listCalendars().toList()
-                log.log(Level.INFO, "Row-store server $server (protocol $proto): ${calendars.size} calendar(s)")
+                val listing = account.listCalendars()
+                if (proto != "4.3")
+                    log.warning(
+                        "Row-store server reports protocol $proto (this client targets 4.3); " +
+                            "batch reads will degrade to per-row GETs")
+                log.log(Level.INFO, "Row-store server $server (protocol $proto): " +
+                    "${listing.calendars.size} calendar(s), ${listing.corruptRowIds.size} corrupt cmeta row(s)")
 
                 val collections = HashMap<Url, Collection>()
-                for (calendar in calendars) {
+                for (calendar in listing.calendars) {
                     val url = RowStoreUrls.collectionUrl(server, calendar.uuid)
                     collections[url] = Collection(
                         type = Collection.TYPE_CALENDAR,

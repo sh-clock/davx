@@ -27,8 +27,8 @@ import at.bitfire.davdroid.network.HttpClientBuilder
 import at.bitfire.davdroid.push.PushRegistrationManager
 import at.bitfire.davdroid.repository.AccountRepository
 import at.bitfire.davdroid.repository.DavServiceRepository
+import at.bitfire.davdroid.resource.rowstore.RowStoreAuthenticationException
 import at.bitfire.davdroid.servicedetection.RefreshCollectionsWorker.Companion.ARG_SERVICE_ID
-import at.bitfire.davdroid.servicedetection.RowStoreCollectionRefresher
 import at.bitfire.davdroid.sync.SyncNotificationManager
 import at.bitfire.davdroid.sync.account.InvalidAccountException
 import at.bitfire.davdroid.ui.DebugInfoActivity
@@ -157,14 +157,22 @@ class RefreshCollectionsWorker @AssistedInject constructor(
             // v4.3) are NOT WebDAV servers: refresh them with the row-store
             // protocol. The WebDAV refresh chain below would PROPFIND the JSON
             // API, get a silent-drop 404 and DELETE the collections.
-            if (rowStoreCollectionRefresher.refresh(service, accountId)) {
-                logger.info("Row-store service refreshed")
+            try {
+                if (rowStoreCollectionRefresher.refresh(service, accountId)) {
+                    logger.info("Row-store service refreshed")
 
-                // credentials were accepted (the refresh derives the keys)
-                syncNotificationManagerFactory.create(accountId).dismissAuthenticationFailed()
+                    // credentials were accepted (the refresh derives the keys)
+                    syncNotificationManagerFactory.create(accountId).dismissAuthenticationFailed()
 
-                // row-store collections have no push subscriptions; nothing to update
-                return Result.success()
+                    // row-store collections have no push subscriptions; nothing to update
+                    return Result.success()
+                }
+            } catch (e: RowStoreAuthenticationException) {
+                // wrong provisioning code / changed password — same handling as
+                // the WebDAV path's UnauthorizedException below
+                logger.log(Level.SEVERE, "Row-store authentication failed", e)
+                syncNotificationManagerFactory.create(accountId).notifyAuthenticationFailed()
+                return Result.failure()
             }
 
             // create authenticating HttpClient (credentials taken from account settings)
