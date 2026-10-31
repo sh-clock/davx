@@ -144,7 +144,7 @@ class RowStoreCollectionRefresher @Inject constructor(
      * row-store. (Only consulted when the marker is null; a real CalDAV server
      * serving that exact shape would be indistinguishable — accepted risk.)
      */
-    private fun rowStoreServerFromCollectionShape(service: Service): Url? {
+    private suspend fun rowStoreServerFromCollectionShape(service: Service): Url? {
         if (service.type != Service.TYPE_CALDAV)
             return null
         val collections = collectionRepository.getByService(service.id)

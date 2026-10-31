@@ -79,7 +79,7 @@ class RowStoreWebDavCollection(
         delegate.multiget(
             urls,
             at.bitfire.davdroid.resource.rowstore.RowStoreCollection.Capabilities(
-                maxCalResourceSize = capabilities.maxCalResourceSize
+                maxCalResourceSize = capabilities.maxCalResourceSize ?: 64L * 1024
             )
         ).map { WebDavCollection.MultiGetItem(url = it.url, eTag = it.eTag, scheduleTag = null, content = it.content) }
 
