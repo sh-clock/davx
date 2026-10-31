@@ -40,6 +40,7 @@ if (!buildCacheUrl.isNullOrEmpty()) {
 
 include(":app-ose")
 include(":core")
+include(":rowstore")
 include(":synctools")
 
 include(":features:preconfigured-settings:api")
